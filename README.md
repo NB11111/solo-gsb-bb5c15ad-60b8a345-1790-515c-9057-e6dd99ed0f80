@@ -29,7 +29,8 @@
 
 此外支持**群体遥测静默检测**：`GET /telemetry-outages` 按去重后的箱号列表、
 共同序号区间、最大允许静默秒数与最少同时静默箱数，对每箱区间内实际事件做
-等权保序校正时间，把相邻校正间隔**严格大于**阈值的部分作为半开静默区间，
+等权保序校正时间，把相邻校正间隔**严格大于**阈值的部分作为半开静默区间
+（阈值按请求原值精确解析为十进制数，间隔恰好等于阈值不算静默），
 再对各箱区间做**端点扫描**，输出至少指定数量箱同时静默的**极大时间段**及
 段内峰值同时静默数（端点相接的合格段合并）。全程只读，不写库、不改任何记录。
 
@@ -1270,6 +1271,11 @@ curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&t
 - 相邻两条事件的**校正时间间隔严格大于** `max_silence_seconds` 时，以这两个校正时间
   作为该箱的**半开静默区间** `[start_time, end_time)`；间隔**恰好等于阈值不算静默**，
   校正后间隔为零（同一合并块）也不算。**不足两条事件的箱不产生任何区间**。
+- **阈值边界规则（精确判定）**：`max_silence_seconds` 按请求原值（十进制文本）
+  **精确解析**，不经过二进制浮点，再换算为整数微秒与保序校正后的整数微秒间隔
+  比较。因此像 `0.3` 这样无法被 double 精确表示的阈值也不会误判：校正后恰好
+  相隔 0.3 秒（300000 微秒）且阈值为 `0.3` 时**不**生成静默区间；只有间隔
+  **严格超过**阈值（如 0.300001 秒）才生成半开静默区间。
 - 对各箱静默区间做**端点扫描**（半开语义：同一时刻先处理区间结束、再处理区间开始，
   同箱的相邻静默区间不会重复计数），输出同时静默箱数 **`>= min_simultaneous_boxes`**
   的**极大时间段**，并给出段内**峰值同时静默箱数**；
@@ -1282,7 +1288,7 @@ curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&t
 | ----------------------- | ---------------------------------------------------------------------- |
 | `box_codes`             | 参与检测的箱号，**重复参数逐个给出**（如 `box_codes=A&box_codes=B`）；至少 1 个，自动去重（保序）；去空白后为空或超过 64 字符返回 `422` |
 | `seq_from` / `seq_to`   | 共同序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to` |
-| `max_silence_seconds`   | 最大允许静默秒数，**必须为正的有限数值**（负数、0、`NaN`/`Infinity` 均 `422`）；间隔**严格大于**它才算静默 |
+| `max_silence_seconds`   | 最大允许静默秒数，**必须为正的有限数值**（负数、0、`NaN`/`Infinity`、非数值、超出 double 有限表示范围的值均 `422`）；**按请求原值精确解析为十进制数**（不经过二进制浮点），间隔**严格大于**它才算静默，恰好等于不算 |
 | `min_simultaneous_boxes`| 最少同时静默箱数，**正整数**（`>= 1`）；达到该数量的时间段才输出        |
 
 返回字段：
@@ -1301,7 +1307,7 @@ curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&t
 
 错误情况：**任一**指定箱号不存在（从未上报过事件）返回 `404`，`detail.missing_box_codes`
 列出全部缺失箱号（按请求顺序）；缺少参数、参数非法（含 `seq_from > seq_to`、
-阈值非正数 / `NaN` / `Infinity`、箱号为空等）返回 `422`。
+阈值非正数 / `NaN` / `Infinity` / 非数值 / 超出 double 有限表示范围、箱号为空等）返回 `422`。
 
 ```bash
 # 三台箱（UTC；秒）：
@@ -1398,6 +1404,34 @@ curl -i -G 'http://localhost:8000/telemetry-outages' \
   --data-urlencode 'box_codes=BOX-O1' \
   --data-urlencode 'seq_from=0' --data-urlencode 'seq_to=10' \
   --data-urlencode 'max_silence_seconds=0' --data-urlencode 'min_simultaneous_boxes=1'
+```
+
+阈值边界示例（精确判定规则）：下面两箱的原始事件时间分别为
+`00:00:00.000 / 00:00:00.400 / 00:00:00.200`（seq=2 发生时钟回拨），保序校正后
+为 `0 / 0.3s / 0.3s`，即相邻校正间隔**恰好 0.3 秒**。阈值按请求原值精确解析，
+`0.3` 不会被二进制浮点误差缩小，因此恰隔 0.3 秒**不**算静默：
+
+```bash
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-P1","seq":0,"temperature":-5.0,"event_time":"2026-09-25T00:00:00.000000+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-P1","seq":1,"temperature":-5.0,"event_time":"2026-09-25T00:00:00.400000+00:00"}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"box_code":"BOX-P1","seq":2,"temperature":-5.0,"event_time":"2026-09-25T00:00:00.200000+00:00"}'
+# BOX-P2 同样上报上述三条事件……
+
+# 阈值 0.3、校正后恰隔 0.3 秒 -> 不产生静默区间（outages=[]），不会误报多箱同时静默
+curl -G 'http://localhost:8000/telemetry-outages' \
+  --data-urlencode 'box_codes=BOX-P1' --data-urlencode 'box_codes=BOX-P2' \
+  --data-urlencode 'seq_from=0' --data-urlencode 'seq_to=10' \
+  --data-urlencode 'max_silence_seconds=0.3' --data-urlencode 'min_simultaneous_boxes=2'
+# {"box_codes":["BOX-P1","BOX-P2"],"box_count":2,...,"outage_count":0,"outages":[]}
+
+# 阈值 0.2（严格小于 0.3 秒间隔）-> 两箱在 [00:00:00, 00:00:00.300000) 同时静默，峰值 2
+curl -G 'http://localhost:8000/telemetry-outages' \
+  --data-urlencode 'box_codes=BOX-P1' --data-urlencode 'box_codes=BOX-P2' \
+  --data-urlencode 'seq_from=0' --data-urlencode 'seq_to=10' \
+  --data-urlencode 'max_silence_seconds=0.2' --data-urlencode 'min_simultaneous_boxes=2'
 ```
 
 ## 多箱设备补报调度预览（retransmission-preview）
@@ -1616,9 +1650,13 @@ curl -i -X POST http://localhost:8000/retransmission-preview \
   按请求顺序去重并拒绝空/超长箱号（422）；服务层一次性校验全部箱号存在
   （任一缺失即 404，`missing_box_codes` 一并返回），再单次查询所有箱区间内
   实际事件（按箱 + seq 排序），缺号不补点。每箱复用 clock-audit 同款整数微秒
-  PAVA 等权保序校正，相邻校正间隔与阈值的比较用 `Fraction` 精确进行：
+  PAVA 等权保序校正；`max_silence_seconds` 在路由层按请求原值（十进制文本）
+  精确解析为 `Decimal`（不经过二进制浮点，正数且有限才合法，否则 422），
+  服务层将其无损换算为整数微秒后与校正后的整数微秒间隔比较：
   静默区间为**半开** `[t_i, t_{i+1})`，仅当间隔**严格大于**阈值时产生，
-  恰好等于阈值不算；不足两条事件的箱不产生区间。随后对各箱区间做端点扫描
+  恰好等于阈值不算（如阈值 `0.3` 与恰好 0.3 秒即 300000 微秒的间隔，
+  不会因 double 无法精确表示 0.3 而误判为静默）；不足两条事件的箱不产生区间。
+  随后对各箱区间做端点扫描
   （同一时刻先结算区间结束、再结算区间开始，半开语义下同箱相邻区间不会重复
   计数），相邻事件点之间同时静默箱数恒定为一个基本段；把端点相接的合格基本段
   直接并入同一个未闭合段，即得到同时静默数达标的极大时间段，段内峰值同时静默

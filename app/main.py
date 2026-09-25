@@ -1,6 +1,7 @@
 """FastAPI 入口与路由。"""
 import math
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
@@ -42,7 +43,8 @@ app = FastAPI(
         "GET /boxes/{box_code}/calibration-trajectory 按锚点线性插值给出校准温度，"
         "缺报序号不补事件，且不改写原始事件或现有状态与分析结果\n"
         "- 群体遥测静默：GET /telemetry-outages 按去重箱号列表 + 共同序号区间检测"
-        "相邻校正间隔严格超过阈值的静默区间，端点扫描输出至少指定数量箱同时静默的"
+        "相邻校正间隔严格超过阈值的静默区间（阈值按请求原值精确解析为十进制数，"
+        "间隔恰好等于阈值不算静默），端点扫描输出至少指定数量箱同时静默的"
         "极大时间段及段内峰值同时静默数（只读）\n"
         "- 校准版本切换影响审计：GET /boxes/{box_code}/calibration-impact 复用两版"
         "已存锚点的序号线性插值分别计算校准温度，按低于下限/区间内（含边界）/高于上限"
@@ -593,11 +595,12 @@ def get_telemetry_outages(
     seq_from: Annotated[int, Query(ge=0, description="起始序号（含）")],
     seq_to: Annotated[int, Query(ge=0, description="结束序号（含）")],
     max_silence_seconds: Annotated[
-        float,
+        Decimal,
         Query(
             gt=0,
             allow_inf_nan=False,
-            description="最大允许静默秒数（正数）；相邻校正时间间隔严格大于它才计为静默",
+            description="最大允许静默秒数（正数，按请求原值精确解析为十进制数，"
+            "不经过二进制浮点）；相邻校正时间间隔严格大于它才计为静默，恰好等于不算",
         ),
     ],
     min_simultaneous_boxes: Annotated[
@@ -612,6 +615,19 @@ def get_telemetry_outages(
                 "message": f"seq_from({seq_from}) 不能大于 seq_to({seq_to})",
                 "seq_from": seq_from,
                 "seq_to": seq_to,
+            },
+        )
+    # 阈值已按请求原值精确解析为正且有限的十进制数；但超出 double 有限表示范围
+    # 的值（如 1e999）无法在响应中回显（float 溢出为 inf），按非法阈值拒绝
+    if not math.isfinite(float(max_silence_seconds)):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_threshold",
+                "message": (
+                    f"max_silence_seconds({max_silence_seconds}) 超出可表示的有限数值范围"
+                ),
+                "max_silence_seconds": str(max_silence_seconds),
             },
         )
     # 箱号去空白后按请求顺序去重；空箱号或超长箱号视为参数无效

@@ -5,6 +5,7 @@ import json
 import math
 from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from fractions import Fraction
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
@@ -1535,7 +1536,7 @@ def telemetry_outages(
     box_codes: list[str],
     seq_from: int,
     seq_to: int,
-    max_silence_seconds: float,
+    max_silence_seconds: Decimal,
     min_simultaneous_boxes: int,
 ) -> schemas.TelemetryOutagesResult:
     """多箱群体遥测静默检测（只读即时计算，不写库、不改任何原始记录）。
@@ -1550,8 +1551,10 @@ def telemetry_outages(
     - 对各箱静默区间做端点扫描（半开区间：同一时刻先处理区间结束、再处理区间开始），
       输出同时静默箱数 >= min_simultaneous_boxes 的极大时间段及段内峰值同时静默数；
       端点相接的合格段合并为一段
-    - 阈值比较用精确有理数（秒阈值换算为微秒后与整数微秒间隔比较），
-      避免浮点误差在“恰好等于阈值”的边界上误判
+    - max_silence_seconds 在路由层按请求原值（十进制文本）精确解析为 Decimal，
+      不经过二进制浮点；这里换算为精确微秒数后与保序校正后的整数微秒间隔比较，
+      避免浮点误差在“恰好等于阈值”的边界上误判（例如阈值 0.3 与恰好 0.3 秒
+      即 300000 微秒的间隔比较时，不会错判为静默）
     """
     # 1) 指定箱号必须全部存在（至少上报过一条事件），否则 404
     existing_rows = db.scalars(
@@ -1586,6 +1589,7 @@ def telemetry_outages(
         events_by_box[row.box_code].append(row)
 
     # 3) 逐箱做等权保序校正，间隔严格大于阈值 -> 半开静默区间（整数微秒）
+    # 阈值为按请求原值精确解析的 Decimal，Fraction 转换无损（如 0.3 -> 300000 整）
     threshold_micros = Fraction(max_silence_seconds) * 1_000_000
     silence_intervals: list[tuple[int, int]] = []  # (起点微秒, 终点微秒)，半开
     for code in box_codes:
@@ -1648,7 +1652,8 @@ def telemetry_outages(
         box_count=len(box_codes),
         seq_from=seq_from,
         seq_to=seq_to,
-        max_silence_seconds=max_silence_seconds,
+        # 响应字段为 float；路由层已保证阈值可表示为有限 double，回显安全
+        max_silence_seconds=float(max_silence_seconds),
         min_simultaneous_boxes=min_simultaneous_boxes,
         outage_count=len(outages),
         outages=outages,
