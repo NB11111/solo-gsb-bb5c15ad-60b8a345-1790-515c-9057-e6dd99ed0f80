@@ -5,7 +5,10 @@ import json
 import math
 from bisect import bisect_left, bisect_right
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from fractions import Fraction
+from typing import NamedTuple
+
 from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -1530,12 +1533,74 @@ def calibration_impact(
 RETRANSMISSION_MAX_SPAN = 60
 
 
+class SilenceThreshold(NamedTuple):
+    """max_silence_seconds 按请求原值精确解析后的阈值。
+
+    - fraction：十进制阈值的精确有理数值（秒），用于与整数微秒间隔精确比较
+    - echo_float：阈值的有限 float 形式，仅用于响应回显
+    """
+
+    fraction: Fraction
+    echo_float: float
+
+
+def parse_silence_threshold(raw: str) -> SilenceThreshold:
+    """把 query 中的 max_silence_seconds 按请求原值精确解析为十进制阈值。
+
+    路由层不再让 FastAPI 先转 float（float("0.3") 会引入二进制误差，导致
+    间隔恰为 0.3 秒、阈值写 0.3 时被误判为“严格超过”），而是把原始字符串
+    交给 Decimal 按十进制语义解析，再转 Fraction 参与精确比较。
+
+    非法输入抛 422（invalid_silence_threshold）：
+    - 不是十进制数（空串、含非数字字符等）；
+    - NaN/Infinity（非有限值）；
+    - 0 或负数；
+    - 小于 1 微秒的正数：间隔以整数微秒度量，此类阈值永远不会被“严格超过”，
+      且无法换算成有意义的微秒阈值；
+    - 超过 float 范围（响应需要回显有限数值）。
+    """
+    try:
+        value = Decimal(raw.strip())
+    except InvalidOperation:
+        value = None
+
+    if value is None or not value.is_finite() or value <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_silence_threshold",
+                "message": "max_silence_seconds 必须是正的有限十进制数（秒）",
+                "max_silence_seconds": raw,
+            },
+        )
+
+    try:
+        echo_float = float(value)
+    except OverflowError:  # 部分实现对超大指数抛 OverflowError 而非返回 inf
+        echo_float = float("inf")
+    # 先排掉超过 float 范围的值（响应需要回显有限数值），避免再为超大十进制
+    # 构造分母巨大的 Fraction；微秒是间隔度量的最小单位，阈值不足 1 微秒时
+    # 任何整数微秒间隔都不可能严格超过它，同样按非法阈值拒绝
+    if not math.isfinite(echo_float) or value * Decimal(1_000_000) < 1:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_silence_threshold",
+                "message": (
+                    "max_silence_seconds 必须是不小于 1 微秒（0.000001 秒）的有限值"
+                ),
+                "max_silence_seconds": raw,
+            },
+        )
+    return SilenceThreshold(fraction=Fraction(value), echo_float=echo_float)
+
+
 def telemetry_outages(
     db: Session,
     box_codes: list[str],
     seq_from: int,
     seq_to: int,
-    max_silence_seconds: float,
+    max_silence_seconds: SilenceThreshold,
     min_simultaneous_boxes: int,
 ) -> schemas.TelemetryOutagesResult:
     """多箱群体遥测静默检测（只读即时计算，不写库、不改任何原始记录）。
@@ -1550,8 +1615,9 @@ def telemetry_outages(
     - 对各箱静默区间做端点扫描（半开区间：同一时刻先处理区间结束、再处理区间开始），
       输出同时静默箱数 >= min_simultaneous_boxes 的极大时间段及段内峰值同时静默数；
       端点相接的合格段合并为一段
-    - 阈值比较用精确有理数（秒阈值换算为微秒后与整数微秒间隔比较），
-      避免浮点误差在“恰好等于阈值”的边界上误判
+    - 阈值由路由层把 query 原始字符串按十进制语义精确解析（parse_silence_threshold），
+      换算为微秒后与保序校正得到的整数微秒间隔做精确比较，避免先转 float 带来的
+      二进制误差在“恰好等于阈值”（如阈值 0.3 秒、间隔恰为 300000 微秒）边界上误判
     """
     # 1) 指定箱号必须全部存在（至少上报过一条事件），否则 404
     existing_rows = db.scalars(
@@ -1586,7 +1652,9 @@ def telemetry_outages(
         events_by_box[row.box_code].append(row)
 
     # 3) 逐箱做等权保序校正，间隔严格大于阈值 -> 半开静默区间（整数微秒）
-    threshold_micros = Fraction(max_silence_seconds) * 1_000_000
+    #    阈值按请求原值精确解析（Decimal -> Fraction），换算为微秒后与整数
+    #    微秒间隔精确比较；间隔恰为 300000 微秒、阈值写 0.3 时判为相等，不产生区间
+    threshold_micros = max_silence_seconds.fraction * 1_000_000
     silence_intervals: list[tuple[int, int]] = []  # (起点微秒, 终点微秒)，半开
     for code in box_codes:
         events = events_by_box[code]
@@ -1595,7 +1663,7 @@ def telemetry_outages(
         corrected, _ = _isotonic_suggestions(events)
         for i in range(len(events) - 1):
             start_micros, end_micros = corrected[i], corrected[i + 1]
-            if Fraction(end_micros - start_micros) > threshold_micros:
+            if end_micros - start_micros > threshold_micros:
                 silence_intervals.append((start_micros, end_micros))
 
     # 4) 端点扫描：半开区间在同一时刻先结束(-1)后开始(+1)，
@@ -1648,7 +1716,7 @@ def telemetry_outages(
         box_count=len(box_codes),
         seq_from=seq_from,
         seq_to=seq_to,
-        max_silence_seconds=max_silence_seconds,
+        max_silence_seconds=max_silence_seconds.echo_float,
         min_simultaneous_boxes=min_simultaneous_boxes,
         outage_count=len(outages),
         outages=outages,

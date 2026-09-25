@@ -42,8 +42,9 @@ app = FastAPI(
         "GET /boxes/{box_code}/calibration-trajectory 按锚点线性插值给出校准温度，"
         "缺报序号不补事件，且不改写原始事件或现有状态与分析结果\n"
         "- 群体遥测静默：GET /telemetry-outages 按去重箱号列表 + 共同序号区间检测"
-        "相邻校正间隔严格超过阈值的静默区间，端点扫描输出至少指定数量箱同时静默的"
-        "极大时间段及段内峰值同时静默数（只读）\n"
+        "相邻校正间隔严格超过阈值的静默区间；阈值按请求中的十进制原值精确解析"
+        "（不先转 float），与整数微秒校正间隔精确比较，恰好等于阈值不算静默；"
+        "端点扫描输出至少指定数量箱同时静默的极大时间段及段内峰值同时静默数（只读）\n"
         "- 校准版本切换影响审计：GET /boxes/{box_code}/calibration-impact 复用两版"
         "已存锚点的序号线性插值分别计算校准温度，按低于下限/区间内（含边界）/高于上限"
         "判结论，只统计结论改变的事件，将序号连续且变化方向相同的事件合成影响段"
@@ -593,11 +594,13 @@ def get_telemetry_outages(
     seq_from: Annotated[int, Query(ge=0, description="起始序号（含）")],
     seq_to: Annotated[int, Query(ge=0, description="结束序号（含）")],
     max_silence_seconds: Annotated[
-        float,
+        str,
         Query(
-            gt=0,
-            allow_inf_nan=False,
-            description="最大允许静默秒数（正数）；相邻校正时间间隔严格大于它才计为静默",
+            description=(
+                "最大允许静默秒数（正的有限十进制数，支持小数与科学计数法，"
+                "如 0.3、3e-1）；服务端按请求原值精确解析，相邻校正时间间隔"
+                "严格大于它才计为静默，恰好相等不算"
+            ),
         ),
     ],
     min_simultaneous_boxes: Annotated[
@@ -614,6 +617,9 @@ def get_telemetry_outages(
                 "seq_to": seq_to,
             },
         )
+    # 阈值按 query 原值（十进制字符串）精确解析：不能先转 float，否则 0.3 等
+    # 十进制数引入二进制误差，会让“间隔恰等于阈值”被误判为严格超过（422 非法）
+    silence_threshold = services.parse_silence_threshold(max_silence_seconds)
     # 箱号去空白后按请求顺序去重；空箱号或超长箱号视为参数无效
     deduped: list[str] = []
     seen: set[str] = set()
@@ -632,7 +638,7 @@ def get_telemetry_outages(
             seen.add(stripped)
             deduped.append(stripped)
     return services.telemetry_outages(
-        db, deduped, seq_from, seq_to, max_silence_seconds, min_simultaneous_boxes
+        db, deduped, seq_from, seq_to, silence_threshold, min_simultaneous_boxes
     )
 
 

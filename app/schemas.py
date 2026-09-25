@@ -579,7 +579,11 @@ class TelemetryOutagesResult(BaseModel):
     seq_from: int = Field(..., description="查询起始序号（含）")
     seq_to: int = Field(..., description="查询结束序号（含）")
     max_silence_seconds: float = Field(
-        ..., description="最大允许静默秒数：相邻校正时间间隔严格大于它才计为静默"
+        ...,
+        description=(
+            "最大允许静默秒数（按请求十进制原值精确解析后的 float 回显）："
+            "相邻校正时间间隔严格大于它才计为静默，恰好相等不算"
+        ),
     )
     min_simultaneous_boxes: int = Field(
         ..., description="最少同时静默箱数：达到该数量的时间段才输出"

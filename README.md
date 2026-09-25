@@ -29,9 +29,11 @@
 
 此外支持**群体遥测静默检测**：`GET /telemetry-outages` 按去重后的箱号列表、
 共同序号区间、最大允许静默秒数与最少同时静默箱数，对每箱区间内实际事件做
-等权保序校正时间，把相邻校正间隔**严格大于**阈值的部分作为半开静默区间，
-再对各箱区间做**端点扫描**，输出至少指定数量箱同时静默的**极大时间段**及
-段内峰值同时静默数（端点相接的合格段合并）。全程只读，不写库、不改任何记录。
+等权保序校正时间，把相邻校正间隔**严格大于**阈值的部分作为半开静默区间；
+阈值按请求中的**十进制原值精确解析**（`Decimal`，不先转 float），换算为整数
+微秒后与校正间隔比较，**间隔恰好等于阈值不算静默**。再对各箱区间做**端点扫描**，
+输出至少指定数量箱同时静默的**极大时间段**及段内峰值同时静默数（端点相接的
+合格段合并）。全程只读，不写库、不改任何记录。
 
 此外支持**校准版本切换影响审计**：`GET /boxes/{box_code}/calibration-impact`
 同时复用该箱**两个已存校准版本**的锚点（相邻锚点间按序号线性插值、两端沿用
@@ -1270,6 +1272,14 @@ curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&t
 - 相邻两条事件的**校正时间间隔严格大于** `max_silence_seconds` 时，以这两个校正时间
   作为该箱的**半开静默区间** `[start_time, end_time)`；间隔**恰好等于阈值不算静默**，
   校正后间隔为零（同一合并块）也不算。**不足两条事件的箱不产生任何区间**。
+- **阈值按请求原值精确解析（边界规则）**：query 中的 `max_silence_seconds` 是十进制
+  文本（如 `0.3`、`3e-1`），服务端用 `Decimal` 按**十进制原值**解析为精确有理数，
+  再换算成**整数微秒**与校正后的整数微秒间隔比较；**不经过 float**。因此阈值写
+  `0.3` 秒、事件经保序校正后恰隔 `300000` 微秒（0.3 秒）时判定为**恰好相等，不产生
+  静默区间**——避免先转 float 时 `0.3` 的二进制误差把“相等”误判成“严格超过”、
+  进而误报多箱同时静默。比较是**严格大于**：间隔比阈值多 1 微秒（如阈值
+  `0.299999`、间隔 0.3 秒）才生成半开区间；`0.3`、`0.300000`、`3e-1` 是同一个
+  精确阈值。阈值必须是**不小于 1 微秒（`0.000001` 秒）**的正有限十进制数，否则 `422`。
 - 对各箱静默区间做**端点扫描**（半开语义：同一时刻先处理区间结束、再处理区间开始，
   同箱的相邻静默区间不会重复计数），输出同时静默箱数 **`>= min_simultaneous_boxes`**
   的**极大时间段**，并给出段内**峰值同时静默箱数**；
@@ -1282,7 +1292,7 @@ curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&t
 | ----------------------- | ---------------------------------------------------------------------- |
 | `box_codes`             | 参与检测的箱号，**重复参数逐个给出**（如 `box_codes=A&box_codes=B`）；至少 1 个，自动去重（保序）；去空白后为空或超过 64 字符返回 `422` |
 | `seq_from` / `seq_to`   | 共同序号区间，**均为整数且含端点**，必须 `>= 0` 且 `seq_from <= seq_to` |
-| `max_silence_seconds`   | 最大允许静默秒数，**必须为正的有限数值**（负数、0、`NaN`/`Infinity` 均 `422`）；间隔**严格大于**它才算静默 |
+| `max_silence_seconds`   | 最大允许静默秒数，**正的有限十进制数，不小于 1 微秒（`0.000001`）**（负数、0、`NaN`/`Infinity`、非十进制文本均 `422`）；**按请求十进制原值精确解析、不经过 float**，间隔**严格大于**它才算静默，恰好相等（如阈值 `0.3`、间隔恰 `300000` 微秒）不算 |
 | `min_simultaneous_boxes`| 最少同时静默箱数，**正整数**（`>= 1`）；达到该数量的时间段才输出        |
 
 返回字段：
@@ -1301,7 +1311,8 @@ curl -i 'http://localhost:8000/boxes/BOX-IMP/calibration-impact?from_version=1&t
 
 错误情况：**任一**指定箱号不存在（从未上报过事件）返回 `404`，`detail.missing_box_codes`
 列出全部缺失箱号（按请求顺序）；缺少参数、参数非法（含 `seq_from > seq_to`、
-阈值非正数 / `NaN` / `Infinity`、箱号为空等）返回 `422`。
+阈值非正数 / 不足 1 微秒 / `NaN` / `Infinity` / 非十进制文本、箱号为空等）返回 `422`。
+`max_silence_seconds` 非法时 `detail.error` 为 `invalid_silence_threshold`。
 
 ```bash
 # 三台箱（UTC；秒）：
@@ -1376,6 +1387,16 @@ curl -G 'http://localhost:8000/telemetry-outages' \
   --data-urlencode 'box_codes=BOX-O3' \
   --data-urlencode 'seq_from=0' --data-urlencode 'seq_to=10' \
   --data-urlencode 'max_silence_seconds=300' --data-urlencode 'min_simultaneous_boxes=2'
+
+# 小数阈值的精确相等边界（阈值按请求原值精确解析，不先转 float）：
+# 若某箱保序校正后相邻间隔恰为 0.3 秒（300000 微秒，时钟回拨经 PAVA
+# 取整后也可能出现），阈值写 0.3 / 0.300000 / 3e-1 都判为恰好相等 -> 不产生
+# 静默区间；写成 0.299999（比间隔小 1 微秒以上）才严格超过 -> 产生半开区间
+curl -G 'http://localhost:8000/telemetry-outages' \
+  --data-urlencode 'box_codes=BOX-A' \
+  --data-urlencode 'seq_from=0' --data-urlencode 'seq_to=10' \
+  --data-urlencode 'max_silence_seconds=0.3' --data-urlencode 'min_simultaneous_boxes=1'
+# -> 间隔恰 0.3 秒时 outage_count=0；改 max_silence_seconds=0.299999 才检出
 
 # 无任何同时静默时间段（阈值箱数高于实际值）-> 200，outages=[]
 curl -G 'http://localhost:8000/telemetry-outages' \
@@ -1616,7 +1637,11 @@ curl -i -X POST http://localhost:8000/retransmission-preview \
   按请求顺序去重并拒绝空/超长箱号（422）；服务层一次性校验全部箱号存在
   （任一缺失即 404，`missing_box_codes` 一并返回），再单次查询所有箱区间内
   实际事件（按箱 + seq 排序），缺号不补点。每箱复用 clock-audit 同款整数微秒
-  PAVA 等权保序校正，相邻校正间隔与阈值的比较用 `Fraction` 精确进行：
+  PAVA 等权保序校正；路由层把 `max_silence_seconds` 的 **query 原始字符串**交给
+  服务层 `parse_silence_threshold` 用 `Decimal` 按十进制原值精确解析（拒绝非十进制、
+  非有限、非正及不足 1 微秒的输入，抛 422 `invalid_silence_threshold`），再转
+  `Fraction` 换算微秒，与整数微秒校正间隔精确比较——**不经过 float**，杜绝
+  `float("0.3")` 的二进制误差把“间隔恰等于阈值”误判为严格超过：
   静默区间为**半开** `[t_i, t_{i+1})`，仅当间隔**严格大于**阈值时产生，
   恰好等于阈值不算；不足两条事件的箱不产生区间。随后对各箱区间做端点扫描
   （同一时刻先结算区间结束、再结算区间开始，半开语义下同箱相邻区间不会重复
